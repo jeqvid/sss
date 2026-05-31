@@ -41,6 +41,8 @@ else:
 
 # ── Duration map ──────────────────────────────────────────────────────────────
 DURATIONS = {
+    "3min":  timedelta(minutes=3),
+    "30min": timedelta(minutes=30),
     "1d":    timedelta(days=1),
     "3d":    timedelta(days=3),
     "1w":    timedelta(weeks=1),
@@ -48,6 +50,8 @@ DURATIONS = {
     "perma": None,
 }
 DURATION_LABELS = {
+    "3min":  "3 Minutes",
+    "30min": "30 Minutes",
     "1d":    "1 Day",
     "3d":    "3 Days",
     "1w":    "1 Week",
