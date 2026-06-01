@@ -6,6 +6,13 @@ Install: python -m pip install flask psycopg2-binary
 Environment variables:
     BOT_SECRET   — must match discord_bot.py
     DATABASE_URL — PostgreSQL connection string (from Supabase)
+
+Fixes vs previous version:
+    - expires_at is no longer set at key generation time.
+      It is calculated from now() only when the key is first activated
+      (HWID bound), so the timer starts when the user actually uses the key.
+    - /reset now also clears expires_at so the full duration is granted
+      again on the next bind (useful when resetting for a new PC).
 """
 
 from flask import Flask, request, jsonify
@@ -67,13 +74,13 @@ def init_db():
         cur.execute("""
             CREATE TABLE IF NOT EXISTS keys (
                 key        TEXT PRIMARY KEY,
-                hwid       TEXT    DEFAULT NULL,
-                duration   TEXT    DEFAULT 'perma',
+                hwid       TEXT      DEFAULT NULL,
+                duration   TEXT      DEFAULT 'perma',
                 expires_at TIMESTAMP DEFAULT NULL,
                 created_at TIMESTAMP NOT NULL,
                 bound_at   TIMESTAMP DEFAULT NULL,
-                note       TEXT    DEFAULT NULL,
-                revoked    BOOLEAN DEFAULT FALSE
+                note       TEXT      DEFAULT NULL,
+                revoked    BOOLEAN   DEFAULT FALSE
             )
         """)
         conn.commit()
@@ -82,8 +89,6 @@ def init_db():
 def row_to_dict(row):
     if row is None:
         return None
-    if hasattr(row, 'keys'):   # psycopg2 RealDictRow or sqlite3.Row
-        return dict(row)
     return dict(row)
 
 def fetch_one(cur, query, params=()):
@@ -122,7 +127,7 @@ def auth(data):
 
 @app.route("/generate", methods=["POST"])
 def generate():
-    data     = request.get_json(silent=True) or {}
+    data = request.get_json(silent=True) or {}
     if not auth(data):
         return jsonify({"error": "unauthorized"}), 403
 
@@ -130,25 +135,29 @@ def generate():
     if duration not in DURATIONS:
         return jsonify({"error": f"Invalid duration. Use: {', '.join(DURATIONS)}"}), 400
 
-    note       = data.get("note", "")
-    delta      = DURATIONS[duration]
-    expires_at = (now_utc() + delta) if delta else None
-    key        = make_key()
+    note = data.get("note", "")
+    key  = make_key()
 
+    # FIX: Do NOT set expires_at at generation time.
+    # The timer starts when the user first activates (binds) the key,
+    # so an unactivated key never silently expires in a drawer.
     with get_db() as conn:
         cur = conn.cursor()
         cur.execute(
-            f"INSERT INTO keys (key, duration, expires_at, created_at, note) VALUES ({PH},{PH},{PH},{PH},{PH})",
-            (key, duration, expires_at, now_utc(), note)
+            f"INSERT INTO keys (key, duration, expires_at, created_at, note) "
+            f"VALUES ({PH},{PH},NULL,{PH},{PH})",
+            (key, duration, now_utc(), note)
         )
         conn.commit()
 
-    print(f"[KEY] Generated: {key} ({DURATION_LABELS[duration]})")
+    label = DURATION_LABELS[duration]
+    print(f"[KEY] Generated: {key} ({label})")
     return jsonify({
         "key":        key,
-        "duration":   DURATION_LABELS[duration],
-        "expires_at": expires_at.isoformat() if expires_at else None
+        "duration":   label,
+        "expires_at": None   # set on first activation, not now
     })
+
 
 @app.route("/validate", methods=["POST"])
 def validate():
@@ -160,9 +169,11 @@ def validate():
         return jsonify({"valid": False, "message": "Missing key or HWID."})
 
     with get_db() as conn:
-        cur = conn.cursor()
         if DB_URL:
             cur = conn.cursor(cursor_factory=RealDictCursor)
+        else:
+            cur = conn.cursor()
+
         row = fetch_one(cur, f"SELECT * FROM keys WHERE key = {PH}", (key,))
 
         if not row:
@@ -172,6 +183,7 @@ def validate():
         if is_expired(row["expires_at"]):
             return jsonify({"valid": False, "message": "Key has expired."})
 
+        # First activation — bind HWID and start the expiry timer NOW
         if row["hwid"] is None:
             delta      = DURATIONS.get(row["duration"] or "perma")
             expires_at = (now_utc() + delta) if delta else None
@@ -184,10 +196,12 @@ def validate():
             print(f"[KEY] Activated: {key} ({label}) → {hwid[:12]}…")
             return jsonify({"valid": True, "message": f"Key activated! ({label})"})
 
+        # Already bound — must match
         if row["hwid"] == hwid:
             return jsonify({"valid": True, "message": "OK"})
 
-        return jsonify({"valid": False, "message": "Key is invalid."})
+        return jsonify({"valid": False, "message": "Key is bound to a different machine."})
+
 
 @app.route("/revoke", methods=["POST"])
 def revoke():
@@ -195,11 +209,15 @@ def revoke():
     if not auth(data):
         return jsonify({"error": "unauthorized"}), 403
     key = data.get("key", "").strip().upper()
+    if not key:
+        return jsonify({"error": "No key provided."}), 400
     with get_db() as conn:
         cur = conn.cursor()
         cur.execute(f"UPDATE keys SET revoked=TRUE WHERE key={PH}", (key,))
         conn.commit()
+    print(f"[KEY] Revoked: {key}")
     return jsonify({"ok": True})
+
 
 @app.route("/reset", methods=["POST"])
 def reset_hwid():
@@ -207,11 +225,20 @@ def reset_hwid():
     if not auth(data):
         return jsonify({"error": "unauthorized"}), 403
     key = data.get("key", "").strip().upper()
+    if not key:
+        return jsonify({"error": "No key provided."}), 400
     with get_db() as conn:
         cur = conn.cursor()
-        cur.execute(f"UPDATE keys SET hwid=NULL, bound_at=NULL WHERE key={PH}", (key,))
+        # FIX: also clear expires_at so the user gets their full duration
+        # again on the next machine, not whatever time was left on the old one.
+        cur.execute(
+            f"UPDATE keys SET hwid=NULL, bound_at=NULL, expires_at=NULL WHERE key={PH}",
+            (key,)
+        )
         conn.commit()
+    print(f"[KEY] HWID reset: {key}")
     return jsonify({"ok": True})
+
 
 @app.route("/list", methods=["POST"])
 def list_keys():
@@ -219,19 +246,24 @@ def list_keys():
     if not auth(data):
         return jsonify({"error": "unauthorized"}), 403
     with get_db() as conn:
-        cur = conn.cursor()
         if DB_URL:
             cur = conn.cursor(cursor_factory=RealDictCursor)
-        cur.execute("SELECT key, hwid, duration, expires_at, created_at, bound_at, note, revoked FROM keys ORDER BY created_at DESC")
+        else:
+            cur = conn.cursor()
+        cur.execute(
+            "SELECT key, hwid, duration, expires_at, created_at, bound_at, note, revoked "
+            "FROM keys ORDER BY created_at DESC"
+        )
         rows = cur.fetchall()
     result = []
     for r in rows:
         d = dict(r)
-        for k in ("expires_at", "created_at", "bound_at"):
-            if d.get(k) and not isinstance(d[k], str):
-                d[k] = d[k].isoformat()
+        for col in ("expires_at", "created_at", "bound_at"):
+            if d.get(col) and not isinstance(d[col], str):
+                d[col] = d[col].isoformat()
         result.append(d)
     return jsonify({"keys": result})
+
 
 # ── Entry ─────────────────────────────────────────────────────────────────────
 
